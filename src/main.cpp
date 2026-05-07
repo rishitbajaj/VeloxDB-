@@ -1,115 +1,91 @@
 #include <iostream>
-#include <map>
 #include <unordered_map>
-#include <fstream>
 #include <string>
+#include <chrono>
+#include <winsock2.h>
+#include <windows.h> // Required for CreateThread
+
+#pragma comment(lib, "ws2_32.lib")
 
 struct Record {
     int id;
     std::string name;
+    std::chrono::steady_clock::time_point expiry;
 };
 
 class VeloxDB {
 private:
-    std::unordered_map<int, Record> hash_index; 
-    std::map<int, Record> btree_index;         
-    const std::string log_path = "data/redo.log";
-
-    void log_to_disk(std::string cmd, int id, std::string name = "") {
-        std::ofstream log_file(log_path, std::ios::app);
-        if (log_file.is_open()) {
-            log_file << cmd << " " << id << " " << name << "\n";
-            log_file.close();
-        }
-    }
-
+    std::unordered_map<int, Record> hash_index;
 public:
-    void insert(int id, std::string name, bool is_recovery = false) {
-        Record r = {id, name};
-        hash_index[id] = r;
-        btree_index[id] = r;
-
-        if (!is_recovery) {
-            log_to_disk("INSERT", id, name);
-            std::cout << "[DB] Successfully inserted " << name << std::endl;
+    std::string process_command(std::string raw) {
+        auto now = std::chrono::steady_clock::now();
+        if (raw.find("INSERT") == 0) {
+            try {
+                size_t s1 = raw.find(' '), s2 = raw.find(' ', s1 + 1);
+                int id = std::stoi(raw.substr(s1 + 1, s2 - s1 - 1));
+                std::string name = raw.substr(s2 + 1);
+                hash_index[id] = {id, name, now + std::chrono::seconds(30)};
+                return "SUCCESS: Inserted " + name;
+            } catch (...) { return "ERROR: Invalid Insert"; }
+        } 
+        if (raw.find("SELECT") == 0) {
+            try {
+                int id = std::stoi(raw.substr(7));
+                if (hash_index.count(id)) {
+                    if (now > hash_index[id].expiry) {
+                        hash_index.erase(id);
+                        return "ERROR: Expired";
+                    }
+                    return "FOUND: " + hash_index[id].name;
+                }
+                return "ERROR: Not Found";
+            } catch (...) { return "ERROR: Invalid Select"; }
         }
-    }
-
-    void select(int id) {
-        if (hash_index.count(id)) {
-            std::cout << "[SUCCESS] Found ID " << id << ": " << hash_index[id].name << std::endl;
-        } else {
-            std::cout << "[ERROR] ID " << id << " not found." << std::endl;
-        }
-    }
-    void remove(int id) {
-        if (hash_index.erase(id)) { // Removes from Hash Map
-            btree_index.erase(id); // Removes from B-Tree
-            log_to_disk("DELETE", id); // Records the deletion on disk
-            std::cout << "[DB] Successfully deleted ID " << id << std::endl;
-        } else {
-            std::cout << "[ERROR] Cannot delete: ID " << id << " not found." << std::endl;
-        }
-    }
-    void recover_data() {
-        std::ifstream log_file(log_path);
-        if (!log_file.is_open()) {
-            std::cout << "[SYSTEM] No log file found. Starting fresh." << std::endl;
-            return;
-        }
-
-        std::string cmd, name;
-        int id;
-        int count = 0;
-        while (log_file >> cmd >> id) {
-        if (cmd == "INSERT") {
-            log_file >> name;
-            insert(id, name, true); 
-        } else if (cmd == "DELETE") {
-            remove(id); // If the log says DELETE, remove it from RAM
-        }
-    }
-        std::cout << "[SYSTEM] Recovered " << count << " records from data/redo.log" << std::endl;
+        return "ERROR: Unknown Command";
     }
 };
 
+VeloxDB db;
+
+// Windows-specific thread function signature
+DWORD WINAPI handle_client(LPVOID lpParam) {
+    SOCKET client_socket = (SOCKET)lpParam;
+    char buffer[1024] = {0};
+    int bytesReceived = recv(client_socket, buffer, 1024, 0);
+    
+    if (bytesReceived > 0) {
+        std::string cmd(buffer);
+        std::cout << "[CLIENT] Request: " << cmd << std::endl;
+        std::string result = db.process_command(cmd) + "\n";
+        send(client_socket, result.c_str(), (int)result.length(), 0);
+    }
+    
+    closesocket(client_socket);
+    return 0;
+}
+
 int main() {
-    // 1. Initialize the Engine
-    VeloxDB db;
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+    SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
     
-    std::cout << "--- VeloxDB Engine Starting ---" << std::endl;
+    sockaddr_in server;
+    server.sin_family = AF_INET;
+    server.sin_addr.s_addr = INADDR_ANY;
+    server.sin_port = htons(9999);
 
-    // 2. RECOVERY PHASE
-    // This is the most important step. It reads data/redo.log 
-    // and rebuilds the memory so you don't lose data from last time.
-    db.recover_data(); 
+    bind(s, (struct sockaddr *)&server, sizeof(server));
+    listen(s, 5);
+    std::cout << ">>> VELOXDB SERVER RUNNING ON PORT 9999 <<<" << std::endl;
 
-    // 3. CREATE (Insert)
-    // We add some users to the database.
-    std::cout << "\n[Step 1] Inserting new records..." << std::endl;
-    db.insert(101, "AlphaUser");
-    db.insert(102, "BetaUser");
-    db.insert(103, "GammaUser");
+    while (true) {
+        SOCKET new_sock = accept(s, NULL, NULL);
+        if (new_sock != INVALID_SOCKET) {
+            // Using Native Windows Threads to bypass the 'std::thread' error
+            CreateThread(NULL, 0, handle_client, (LPVOID)new_sock, 0, NULL);
+        }
+    }
 
-    // 4. READ (Select)
-    // We check if the database can find the user we just added.
-    std::cout << "\n[Step 2] Testing Search (Point Lookup):" << std::endl;
-    db.select(101); // Should succeed
-    db.select(999); // Should show "Not Found" error
-
-    // 5. DELETE
-    // We remove a user to show the database can clean up memory.
-    std::cout << "\n[Step 3] Testing Delete:" << std::endl;
-    db.remove(102); // Deletes BetaUser
-    db.select(102); // Now this should fail
-
-    // 6. Shutdown
-    std::cout << "\n--- System Operations Complete ---" << std::endl;
-    
-    // Keeps the window open on Windows so you can see the results
-    std::cout << "\nPress Enter to close the database...";
-    std::cin.ignore(); // Clears any leftover input
-    std::cin.get();    // Waits for you to hit Enter
-
+    WSACleanup();
     return 0;
 }
