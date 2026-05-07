@@ -1,22 +1,20 @@
-# VeloxDB: High-Performance In-Memory Engine
+# VeloxDB
 
-VeloxDB is a lightweight, high-speed key-value database engine written in C++. It is designed for low-latency applications that require the speed of in-memory processing combined with the reliability of disk-based persistence.
+A high-concurrency, multi-threaded In-Memory Key-Value store built in C++ with a Python testing suite.
 
 ## 🚀 Features
-- **Hybrid Indexing:** Uses a Hash Map for $O(1)$ lookups and a B-Tree for sorted range scans.
-- **ACID Persistence:** Implements Write-Ahead Logging (WAL) to ensure data is never lost, even if the system crashes.
-- **CRUD Operations:** Full support for Creating, Reading, Updating, and Deleting records.
-- **Recovery Engine:** Automatically rebuilds the in-memory state from the `redo.log` file on startup.
+* **Multi-threaded Architecture:** Uses Native Windows Threading (Win32 API) to handle multiple simultaneous client connections.
+* **TCP/IP Networking:** Custom protocol layer allowing remote data interaction via Port 9999.
+* **Time-To-Live (TTL):** Automatic data expiration logic using `std::chrono` to manage memory volatility.
+* **Optimized Indexing:** Leveraging `std::unordered_map` for $O(1)$ average-time complexity on data retrieval.
 
-## 🛠 Project Architecture
-The system follows a tiered architecture:
-1. **Memory Layer:** Fast RAM-based storage using C++ Standard Template Library.
-2. **Persistence Layer:** Append-only logging to ensure durability.
-3. **Validation Layer:** Python-based benchmarking suite to measure latency.
+## 🛠️ Tech Stack
+* **Server:** C++ (WinSock2, Windows API)
+* **Client/Testing:** Python 3 (Socket, Threading)
+* **Compiler:** MinGW / G++
 
-## 🚦 Getting Started (Windows)
+## 🚦 Getting Started
 
-### 1. Compile the Engine
-Use `g++` with high-level optimization:
+### 1. Compile the Server
 ```powershell
-g++ -O3 -std=c++11 src/main.cpp -o veloxdb.exe
+g++ -O3 src/main.cpp -o veloxdb.exe -lws2_32
