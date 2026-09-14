@@ -1,1 +1,9 @@
 *.exe
+veloxdb_core
+velox_store.bin
+velox_store.bin.tmp
+velox_store.wal
+velox_bench.bin
+velox_bench.wal
+*.json
+__pycache__/

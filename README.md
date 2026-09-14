@@ -1,75 +1,144 @@
-# VeloxDB: High-Performance Custom C++ In-Memory Engine
+# VeloxDB
 
-A handcrafted, ultra-low latency, in-memory key-value store engineered entirely from scratch in C++. This engine completely bypasses standard container wrappers (`std::unordered_map`, `std::vector`, `std::map`) to avoid generic allocation overhead and maximize CPU cache locality. It features a dual-indexing system, a handcrafted recursive parser, and a raw binary length-prefixed serialization framework.
+An in-memory key-value engine written from scratch in C++, with a dual-index
+storage layer, a hand-written query front end, and crash recovery through a
+write-ahead log. Every performance number in this README is produced by the
+benchmarking suite in this repo and can be reproduced with one command.
 
-## 🚀 Key Architectural Breakthroughs
+## Design
 
-* **Zero Standard Container Overhead:** To enforce precise spatial complexity controls and microsecond lookup efficiency, the entire database runs on direct heap pointers (`*`), manual dynamic arrays, and handcrafted linked structures.
-* **Dual-Indexing Parity Layer:** Combines a handcrafted Separate-Chaining Hash Map for $O(1)$ point lookups with a customized high-fanout B-Tree architecture to support continuous ordered mapping and rapid structural data access.
-* **Custom Lexical Query Parser:** Features an integrated tokenization engine and scanner built explicitly to compile and parse incoming database interaction strings (`INSERT`, `SELECT`, `DELETE`, `SAVE`) dynamically.
-* **RAII Dynamic Memory Footprint:** Implements self-contained memory tracking pools (`DynamicTokenArray`) that safely orchestrate real-time growth bounds and heap allocation clean-ups without relying on vector extensions.
-* **Length-Prefixed Binary Serialization:** Outperforms slow text-based serialization frameworks (JSON/XML) by streaming memory allocations and data structures into optimized binary disk layouts using length-prefixed serialization primitives.
+### Dual indexing
 
----
+Each record lives in two indexes that are kept in sync on every write:
 
-## 🛠️ Engine Design Internals
+| Index | Structure | Used for | Cost |
+| --- | --- | --- | --- |
+| Point index | Separate-chaining hash map, djb2 hashing, power-of-two buckets, load-factor 0.75 growth | `SELECT` by key | O(1) average |
+| Ordered index | B-Tree, minimum degree 32 (up to 63 keys and 64 children per node) | `RANGE` scans, ordered snapshot writes | O(log n) |
 
-### 1. The Dual-Index Memory Matrix
-The system feeds transaction workloads into two distinct, isolated layout structures to guarantee optimal lookup execution windows:
-* **The Points Tier:** A handcrafted hash matrix utilizing separate chaining via nested `HashNode` linked lists. String mapping targets an optimized bitwise shift layout (`hash = ((hash << 5) + hash) + c`) to ensure balanced distribution spreads across $1024$ continuous buckets.
-* **The Structural Tree Tier:** A high-fanout B-Tree modeling infrastructure tracking localized child nodes, leaves, and horizontal splits recursively to guarantee $O(\log n)$ balance maintenance thresholds.
+The B-Tree uses binary search inside each node and implements full CLRS
+deletion (predecessor/successor promotion, sibling borrowing, node merging), so
+it stays balanced under arbitrary delete patterns rather than being rebuilt.
+The high fanout keeps a 100,000-record tree only 4 levels deep.
 
-### 2. Custom Compilation Pipeline
-Instead of consuming input lines through heavy stream buffers, a bespoke scanner maps the characters linearly:
-[Raw Console Input] ──► [Lexical Scanner] ──► [Dynamic Token Array] ──► [Engine Switch-Dispatched Commit]
+### Containers
 
-The query parsing block decodes multi-word string statements wrapped inside quotation boundaries natively, mitigating spatial mutations efficiently.
+The engine implements its own hash map, B-Tree, and growable array
+(`DynamicArray<T>`) rather than using `std::unordered_map`, `std::map`, or
+`std::vector`. It does use `std::string` for keys and values, and `std::fstream`
+for file I/O.
 
----
+### Query front end
 
-## 💻 Technical Specifications & Interface
+A hand-written lexer scans the input line into tokens, handling single- and
+double-quoted string literals, and a dispatcher executes the statement:
 
-### Database Grammars Supported
-* `INSERT <key> "<value>"` - Commits a variable-length tracking block safely into the storage engine matrix.
-* `SELECT <key>` - Queries point targets out of the Hash Tier instantly via raw pointers, outputting high-resolution resolution metrics in nanoseconds.
-* `DELETE <key>` - Purges data elements natively across parity dimensions and balances existing trees.
-* `SAVE` - Generates a raw binary file snapshot (`velox_store.bin`) reflecting true in-memory layouts.
-* `EXIT` - Restores environment states and triggers automated recursive class destructors.
+```
+[input line] -> [lexer] -> [DynamicArray<Token>] -> [dispatch] -> [indexes + WAL]
+```
 
----
+### Durability
 
-## ⚡ Setup, Compiling & Benchmarking
+Two files back the engine:
 
-The database codebase is fully self-contained inside a single optimized script file (`veloxdb_core.cpp`) and does not require third-party dependencies.
+* `velox_store.bin` — length-prefixed binary snapshot, written in key order,
+  with a magic header. Written to a temp file and renamed into place so an
+  interrupted `SAVE` cannot corrupt the previous snapshot.
+* `velox_store.wal` — append-only write-ahead log. Every `INSERT` and `DELETE`
+  is appended and flushed *before* the write is acknowledged.
 
-### Compilation
-To maximize loop optimization and trigger vectorization schemes within the low-level custom structures, compile the script using extreme compiler flags (`-O3` aggression tier):
+On startup the engine loads the snapshot and replays the log on top of it, so a
+process killed mid-session comes back with all acknowledged writes. A truncated
+final log record (from a process killed mid-write) is detected and discarded.
+`SAVE` writes a fresh snapshot and compacts the log to zero bytes.
+
+Note on scope: the log is flushed to the OS on every write, which survives a
+process crash. It is not `fsync`ed, so it does not claim to survive a power loss.
+
+## Commands
+
+| Command | Description |
+| --- | --- |
+| `INSERT <key> "<value>"` | Write to both indexes, logged first |
+| `SELECT <key>` | Point lookup through the hash index |
+| `DELETE <key>` | Remove from both indexes, logged first |
+| `RANGE <start> <end>` | Ordered scan through the B-Tree, inclusive |
+| `SAVE` | Write a snapshot and compact the log |
+| `STATS` | Record count, bucket count, load factor, B-Tree height |
+| `EXIT` | Quit |
+
+## Build and run
+
+No third-party dependencies:
 
 ```bash
-g++ -O3 veloxdb_core.cpp -o veloxdb_core
-```
-Execution
-Run the compiled binary matrix within any standard terminal window environment:
-```
-Bash
+g++ -O3 -std=c++14 -Wall -Wextra veloxdb_core.cpp -o veloxdb_core
 ./veloxdb_core
 ```
-Interactive Usage Sample
+
 ```
-Plaintext
-====================================================================
- 🔥 VELOXDB SYSTEM MAX ACTIVE MODE (ZERO STANDARD CONTIGUOUS LIBS)  
- Manual Separate Chaining Hash Map | High-Fanout Custom B-Tree      
- Operations: INSERT key "value" | SELECT key | DELETE key | SAVE     
-====================================================================
 veloxdb_engine# INSERT candidate101 "Rishit Bajaj - Systems Engineer"
-[SYSTEM]: Transaction committed to dual-indexes successfully.
+[SYSTEM]: Committed to hash and B-Tree indexes, logged for recovery.
 
 veloxdb_engine# SELECT candidate101
-[VALUE]: Rishit Bajaj - Systems Engineer (Retrieved in 45 ns)
+[VALUE]: Rishit Bajaj - Systems Engineer (hash index, under clock resolution; run --bench for calibrated latency)
 
-veloxdb_engine# SAVE
-[PERSISTENCE]: Native binary snapshot flushed cleanly to persistent memory.
+veloxdb_engine# RANGE candidate100 candidate200
+[RANGE]: 1 record(s) in [candidate100, candidate200]
+  candidate101 => Rishit Bajaj - Systems Engineer
 
-veloxdb_engine# EXIT
+veloxdb_engine# STATS
+[STATS]: records=1 hash_buckets=1024 hash_load_factor=0.001 btree_records=1 btree_height=1
 ```
+
+The binary also runs headless for benchmarking: `--bench N` for the index
+microbenchmark, `--workload N` for the insert/lookup workload, `--quiet` to
+suppress the banner and prompt.
+
+## Benchmarks
+
+```bash
+python3 benchmark.py                       # index sweep; MySQL if one is reachable
+python3 benchmark.py --skip-mysql          # index sweep only
+python3 benchmark.py --mysql-host 127.0.0.1 --mysql-user root --mysql-password secret
+python3 benchmark.py --json results.json   # machine-readable output
+```
+
+### Index sweep
+
+Lookup latency per structure over an identical probe sequence. Measured on
+Windows, MinGW GCC 6.3, `-O3`:
+
+| Records | Hash | B-Tree | Sorted array (binary search) | Flat array (linear scan) | B-Tree height |
+| --- | --- | --- | --- | --- | --- |
+| 1,000 | 11.8 ns | 57.6 ns | 51.1 ns | 1.34 µs | 2 |
+| 10,000 | 12.9 ns | 132.3 ns | 121.4 ns | 15.79 µs | 3 |
+| 100,000 | 13.9 ns | 191.9 ns | 175.6 ns | 148.87 µs | 4 |
+
+Hash lookup latency stays flat at roughly 12–14 ns as the dataset grows 100x,
+which is the O(1) claim holding up. Against flat array storage the indexed
+lookup is 99.1% to 99.99% faster (114x to 10,680x); against a sorted array with
+binary search it is 77% to 92% faster.
+
+Reproduce with `python3 benchmark.py --skip-mysql`. Absolute numbers depend on
+the machine; the scaling behaviour is the point.
+
+### Head-to-head vs MySQL
+
+The suite runs the same workload — N single-row inserts followed by N point
+lookups by key — against VeloxDB and against a live MySQL server, and reports
+latency and throughput side by side. It needs `pymysql` or
+`mysql-connector-python` plus a reachable server:
+
+```bash
+pip install pymysql
+mysql -u root -e "CREATE DATABASE IF NOT EXISTS veloxdb_bench"
+python3 benchmark.py --records 20000 --mysql-user root --mysql-password secret
+```
+
+If no driver or server is available the suite says so explicitly and reports the
+VeloxDB side alone rather than inventing a comparison.
+
+This is not an apples-to-apples fight: MySQL pays for SQL parsing, a
+client/server round trip, and full ACID durability, none of which an embedded
+in-memory store does. The comparison measures the cost of those guarantees.
