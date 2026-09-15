@@ -111,14 +111,14 @@ Windows, MinGW GCC 6.3, `-O3`:
 
 | Records | Hash | B-Tree | Sorted array (binary search) | Flat array (linear scan) | B-Tree height |
 | --- | --- | --- | --- | --- | --- |
-| 1,000 | 11.8 ns | 57.6 ns | 51.1 ns | 1.34 µs | 2 |
-| 10,000 | 12.9 ns | 132.3 ns | 121.4 ns | 15.79 µs | 3 |
-| 100,000 | 13.9 ns | 191.9 ns | 175.6 ns | 148.87 µs | 4 |
+| 1,000 | 15.8 ns | 79.7 ns | 81.4 ns | 1.67 µs | 2 |
+| 10,000 | 20.4 ns | 176.2 ns | 157.9 ns | 21.01 µs | 3 |
+| 100,000 | 16.0 ns | 240.7 ns | 264.7 ns | 203.52 µs | 4 |
 
-Hash lookup latency stays flat at roughly 12–14 ns as the dataset grows 100x,
+Hash lookup latency stays flat at roughly 16–20 ns as the dataset grows 100x,
 which is the O(1) claim holding up. Against flat array storage the indexed
-lookup is 99.1% to 99.99% faster (114x to 10,680x); against a sorted array with
-binary search it is 77% to 92% faster.
+lookup is 99.1% to 99.99% faster (106x to 12,731x); against a sorted array with
+binary search it is 81% to 94% faster.
 
 Reproduce with `python3 benchmark.py --skip-mysql`. Absolute numbers depend on
 the machine; the scaling behaviour is the point.
@@ -136,9 +136,26 @@ mysql -u root -e "CREATE DATABASE IF NOT EXISTS veloxdb_bench"
 python3 benchmark.py --records 20000 --mysql-user root --mysql-password secret
 ```
 
+Measured against MySQL 8.0.46 (InnoDB) over TCP loopback, 20,000 records:
+
+| Engine | Insert µs/op | Insert ops/s | Select µs/op | Select ops/s |
+| --- | --- | --- | --- | --- |
+| VeloxDB | 9.84 | 101,606 | 1.18 | 848,428 |
+| MySQL, matched durability | 274.94 | 3,637 | 183.85 | 5,439 |
+| MySQL, default (fsync per commit) | 13,933.48 | 72 | 213.28 | 4,689 |
+
+Two MySQL rows are reported because durability guarantees have to match before
+a latency comparison means anything. VeloxDB flushes its write-ahead log to the
+OS on every write; MySQL's default additionally `fsync`s to physical media on
+every commit, which is a stronger guarantee and costs roughly 50x on this
+machine. The matched-durability row sets `innodb_flush_log_at_trx_commit=2` and
+`sync_binlog=0` to line MySQL up with what VeloxDB actually promises, and is the
+honest comparison: VeloxDB inserts 27.9x faster and looks up 155.9x faster.
+
+Even at matched durability this is not an apples-to-apples fight. MySQL pays for
+SQL parsing and a client/server round trip that an embedded in-process store
+does not, which is most of the remaining lookup gap. The comparison measures the
+cost of those guarantees, not a defect in MySQL.
+
 If no driver or server is available the suite says so explicitly and reports the
 VeloxDB side alone rather than inventing a comparison.
-
-This is not an apples-to-apples fight: MySQL pays for SQL parsing, a
-client/server round trip, and full ACID durability, none of which an embedded
-in-memory store does. The comparison measures the cost of those guarantees.

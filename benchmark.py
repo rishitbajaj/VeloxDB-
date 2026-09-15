@@ -111,10 +111,26 @@ def mysql_connect(driver_name, driver, cfg):
     )
 
 
-def benchmark_mysql(driver_name, driver, cfg, records):
-    """Same workload the engine runs: N single-row inserts, then N PK lookups."""
+def benchmark_mysql(driver_name, driver, cfg, records, matched_durability=False):
+    """Same workload the engine runs: N single-row inserts, then N PK lookups.
+
+    With matched_durability, InnoDB is told to flush the redo log to the OS once
+    per second instead of fsyncing on every commit. That is the guarantee
+    VeloxDB's WAL actually provides, so it is the apples-to-apples setting;
+    the default (fsync per commit) is strictly stronger.
+    """
     conn = mysql_connect(driver_name, driver, cfg)
     cursor = conn.cursor()
+
+    restore = []
+    if matched_durability:
+        for variable, relaxed in (("innodb_flush_log_at_trx_commit", 2), ("sync_binlog", 0)):
+            try:
+                cursor.execute("SELECT @@GLOBAL.%s" % variable)
+                restore.append((variable, cursor.fetchone()[0]))
+                cursor.execute("SET GLOBAL %s = %d" % (variable, relaxed))
+            except Exception:
+                pass  # needs SUPER; fall back to whatever the server is configured with
 
     cursor.execute("DROP TABLE IF EXISTS %s" % MYSQL_TABLE)
     cursor.execute(
@@ -141,11 +157,17 @@ def benchmark_mysql(driver_name, driver, cfg, records):
     select_seconds = time.perf_counter() - start
 
     cursor.execute("DROP TABLE IF EXISTS %s" % MYSQL_TABLE)
+    for variable, original in restore:
+        try:
+            cursor.execute("SET GLOBAL %s = %s" % (variable, original))
+        except Exception:
+            pass
     cursor.close()
     conn.close()
 
     return {
         "records": records,
+        "matched_durability": matched_durability,
         "insert_total_s": insert_seconds,
         "insert_avg_us": (insert_seconds / records) * 1e6,
         "insert_ops_per_sec": records / insert_seconds,
@@ -212,13 +234,14 @@ def index_sweep(engine, sizes):
 def head_to_head(engine, records, mysql_cfg, skip_mysql):
     header("2. HEAD-TO-HEAD - VeloxDB vs MySQL, identical workload")
     print(" Workload: %d single-row inserts, then %d point lookups by key." % (records, records))
-    print(" VeloxDB durability: write-ahead log flushed per mutation.")
-    print(" MySQL durability:   InnoDB, autocommit on (one transaction per insert).")
+    print(" VeloxDB flushes its write-ahead log to the OS on every mutation, so the")
+    print(" matched-durability MySQL row is the fair comparison; the default row")
+    print(" shows what fsync-per-commit costs on this machine.")
     print()
 
     velox = parse_metrics(run_engine(engine, ["--workload", str(records)]), "WORKLOAD")
 
-    mysql_result = None
+    mysql_runs = []
     if skip_mysql:
         note = "skipped (--skip-mysql)"
     else:
@@ -229,39 +252,46 @@ def head_to_head(engine, records, mysql_cfg, skip_mysql):
         else:
             try:
                 version = mysql_version(driver_name, driver, mysql_cfg)
-                mysql_result = benchmark_mysql(driver_name, driver, mysql_cfg, records)
                 note = "MySQL %s via %s" % (version, driver_name)
+                mysql_runs.append((
+                    "MySQL matched durability",
+                    benchmark_mysql(driver_name, driver, mysql_cfg, records, matched_durability=True)))
+                mysql_runs.append((
+                    "MySQL default (fsync)",
+                    benchmark_mysql(driver_name, driver, mysql_cfg, records)))
             except Exception as exc:  # connection refused, auth failure, missing schema
                 note = "MySQL unreachable at %s:%d - %s" % (
                     mysql_cfg["host"], mysql_cfg["port"], str(exc).split("\n")[0][:90])
 
-    print(" %-22s %14s %14s %14s %14s" %
+    print(" %-26s %13s %13s %13s %13s" %
           ("engine", "insert us/op", "insert ops/s", "select us/op", "select ops/s"))
     rule()
-    print(" %-22s %14.3f %14.0f %14.3f %14.0f" % (
+    print(" %-26s %13.3f %13.0f %13.3f %13.0f" % (
         "VeloxDB", velox["insert_avg_us"], velox["insert_ops_per_sec"],
         velox["select_avg_us"], velox["select_ops_per_sec"]))
+    for label, result in mysql_runs:
+        print(" %-26s %13.3f %13.0f %13.3f %13.0f" % (
+            label, result["insert_avg_us"], result["insert_ops_per_sec"],
+            result["select_avg_us"], result["select_ops_per_sec"]))
 
-    if mysql_result:
-        print(" %-22s %14.3f %14.0f %14.3f %14.0f" % (
-            "MySQL (InnoDB)", mysql_result["insert_avg_us"], mysql_result["insert_ops_per_sec"],
-            mysql_result["select_avg_us"], mysql_result["select_ops_per_sec"]))
-        rule()
-        for label in ("insert", "select"):
-            ratio = mysql_result["%s_avg_us" % label] / velox["%s_avg_us" % label]
-            if ratio >= 1.0:
-                print(" VeloxDB %ss are %.1fx faster than MySQL" % (label, ratio))
-            else:
-                print(" VeloxDB %ss are %.1fx SLOWER than MySQL" % (label, 1.0 / ratio))
+    rule()
+    if mysql_runs:
+        for label, result in mysql_runs:
+            parts = []
+            for op in ("insert", "select"):
+                ratio = result["%s_avg_us" % op] / velox["%s_avg_us" % op]
+                parts.append("%ss %.1fx %s" % (
+                    op, ratio if ratio >= 1.0 else 1.0 / ratio,
+                    "faster" if ratio >= 1.0 else "SLOWER"))
+            print(" VeloxDB vs %-24s %s" % (label + ":", " | ".join(parts)))
         print()
-        print(" Caveat: MySQL pays for SQL parsing, a client/server round trip, and")
-        print(" full ACID durability. This measures the cost of those guarantees, not")
-        print(" a defect in MySQL.")
+        print(" Caveat: MySQL pays for SQL parsing and a client/server round trip that")
+        print(" an embedded in-process store does not. Even at matched durability this")
+        print(" measures the cost of those guarantees, not a defect in MySQL.")
     else:
-        rule()
         print(" MySQL side not measured: %s" % note)
 
-    return velox, mysql_result, note
+    return velox, mysql_runs, note
 
 
 def main():
@@ -295,7 +325,7 @@ def main():
         "host": args.mysql_host, "port": args.mysql_port, "user": args.mysql_user,
         "password": args.mysql_password, "database": args.mysql_database,
     }
-    velox, mysql_result, note = head_to_head(engine, args.records, mysql_cfg, args.skip_mysql)
+    velox, mysql_runs, note = head_to_head(engine, args.records, mysql_cfg, args.skip_mysql)
 
     if args.json:
         with open(args.json, "w") as handle:
@@ -303,7 +333,7 @@ def main():
                 "platform": platform.platform(),
                 "index_sweep": sweep_rows,
                 "veloxdb_workload": velox,
-                "mysql_workload": mysql_result,
+                "mysql_workloads": {label: result for label, result in mysql_runs},
                 "mysql_note": note,
             }, handle, indent=2)
         print("\n Raw results written to %s" % args.json)
